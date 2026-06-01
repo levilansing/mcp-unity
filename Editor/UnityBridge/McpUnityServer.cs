@@ -43,22 +43,50 @@ namespace McpUnity.Unity
         private CancellationTokenSource _cts;
         private TestRunnerService _testRunnerService;
         private ConsoleLogsService _consoleLogsService;
-        
+
         /// <summary>
-        /// Called after every domain reload
+        /// Static constructor invoked by [InitializeOnLoad] on every domain load — including
+        /// play-mode domain reloads, which [DidReloadScripts] does NOT cover. Re-creating the
+        /// instance here re-subscribes the editor lifecycle handlers that a domain reload wipes,
+        /// so the server is reliably stopped before, and restarted after, every reload instead
+        /// of orphaning its listening socket and leaking the port until the editor is restarted.
+        /// </summary>
+        static McpUnityServer()
+        {
+            // Skip in batch mode (Unity Cloud Build, CI, headless builds) to avoid hanging npm.
+            if (Application.isBatchMode)
+            {
+                return;
+            }
+
+            // Defer until the reload settles; touching Instance recreates the singleton and
+            // re-subscribes its event handlers (and starts the server when appropriate).
+            EditorApplication.delayCall += EnsureInitialized;
+        }
+
+        /// <summary>
+        /// Ensures the singleton exists and its editor lifecycle hooks are subscribed.
+        /// Safe to call repeatedly; instance creation is idempotent.
+        /// </summary>
+        private static void EnsureInitialized()
+        {
+            if (Application.isBatchMode)
+            {
+                return;
+            }
+
+            var _ = Instance;
+        }
+
+        /// <summary>
+        /// Called after every script-compilation domain reload
         /// </summary>
         [DidReloadScripts]
         private static void AfterReload()
         {
             // Skip initialization in batch mode (Unity Cloud Build, CI, headless builds)
             // This prevents npm commands from hanging the build process
-            if (Application.isBatchMode)
-            {
-                return;
-            }
-            
-            // Ensure Instance is created and hooks are set up after initial domain load
-            var currentInstance = Instance;
+            EnsureInitialized();
         }
         
         /// <summary>
@@ -124,8 +152,10 @@ namespace McpUnity.Unity
             RegisterResources();
             RegisterTools();
 
-            // Initial start if auto-start is enabled and not recovering from a reload where it was off
-            if (McpUnitySettings.Instance.AutoStartServer)
+            // Initial start if auto-start is enabled. Skip while entering/in Play Mode: a domain
+            // reload during the play transition can orphan the listener socket. The server is
+            // restarted on EnteredEditMode instead (see OnPlayModeStateChanged).
+            if (McpUnitySettings.Instance.AutoStartServer && !EditorApplication.isPlayingOrWillChangePlaymode)
             {
                  StartServer();
             }
@@ -152,6 +182,11 @@ namespace McpUnity.Unity
         /// </summary>
         public void StartServer()
         {
+            StartServer(false);
+        }
+
+        private void StartServer(bool isRetry)
+        {
             // Skip starting server if this is a Multiplayer Play Mode clone instance
             // Only the main editor should run the WebSocket server to avoid port conflicts
             if (McpUtils.IsMultiplayerPlayModeClone())
@@ -170,13 +205,26 @@ namespace McpUnity.Unity
             {
                 var host = McpUnitySettings.Instance.AllowRemoteConnections ? "0.0.0.0" : "localhost";
                 _webSocketServer = new WebSocketServer($"ws://{host}:{McpUnitySettings.Instance.Port}");
+                // Allow rebinding a socket left in TIME_WAIT by a previous server/domain.
+                _webSocketServer.ReuseAddress = true;
                 _webSocketServer.AddWebSocketService("/McpUnity", () => new McpUnitySocketHandler(this));
                 _webSocketServer.Start();
                 McpLogger.LogInfo($"WebSocket server started successfully on {host}:{McpUnitySettings.Instance.Port}.");
             }
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
             {
-                McpLogger.LogError($"Failed to start WebSocket server: Port {McpUnitySettings.Instance.Port} is already in use. {ex.Message}");
+                // A listener from a previous domain/instance may still hold the port. Release the
+                // partially-created server and retry once before surfacing the error to the user.
+                if (!isRetry)
+                {
+                    McpLogger.LogWarning($"Port {McpUnitySettings.Instance.Port} is already in use; releasing any stale listener and retrying once...");
+                    StopServer();
+                    StartServer(true);
+                    return;
+                }
+
+                McpLogger.LogError($"Failed to start WebSocket server: Port {McpUnitySettings.Instance.Port} is already in use. " +
+                    $"A previous server instance may still hold the port — restart the Unity Editor if this persists. {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -191,7 +239,9 @@ namespace McpUnity.Unity
         /// <param name="closeReason">Optional reason message for the close</param>
         public void StopServer(ushort? closeCode = null, string closeReason = null)
         {
-            if (!IsListening)
+            // Tear down whenever a server object exists, even if it is no longer listening
+            // (e.g. a half-initialized server from a failed Start) so its socket is released.
+            if (_webSocketServer == null)
             {
                 return;
             }
@@ -199,12 +249,12 @@ namespace McpUnity.Unity
             try
             {
                 // If a custom close code is provided, close all client connections with that code first
-                if (closeCode.HasValue && _webSocketServer != null)
+                if (closeCode.HasValue)
                 {
                     CloseAllClients(closeCode.Value, closeReason ?? "Server stopping");
                 }
 
-                _webSocketServer?.Stop();
+                _webSocketServer.Stop();
 
                 McpLogger.LogInfo("WebSocket server stopped");
             }
@@ -497,8 +547,9 @@ namespace McpUnity.Unity
         private static void OnAfterAssemblyReload()
         {
             if (Application.isBatchMode || _instance == null) return;
-            
-            if (McpUnitySettings.Instance.AutoStartServer && !_instance.IsListening)
+
+            // Don't restart while in Play Mode; EnteredEditMode handles the edit-mode restart.
+            if (McpUnitySettings.Instance.AutoStartServer && !_instance.IsListening && !EditorApplication.isPlaying)
             {
                 _instance.StartServer();
             }
