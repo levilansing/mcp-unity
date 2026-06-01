@@ -75,6 +75,11 @@ namespace McpUnity.Unity
                 return;
             }
 
+            // Verification aid: this fires on every domain load. [DidReloadScripts] does NOT run on
+            // play-mode reloads, so if you see this on play-enter/exit it came from the static
+            // constructor — confirming [InitializeOnLoad] re-init covers the play-mode path.
+            McpLogger.LogInfo($"Domain load: ensuring MCP server is initialized (isPlaying={EditorApplication.isPlaying}).");
+
             var _ = Instance;
         }
 
@@ -205,8 +210,10 @@ namespace McpUnity.Unity
             {
                 var host = McpUnitySettings.Instance.AllowRemoteConnections ? "0.0.0.0" : "localhost";
                 _webSocketServer = new WebSocketServer($"ws://{host}:{McpUnitySettings.Instance.Port}");
-                // Allow rebinding a socket left in TIME_WAIT by a previous server/domain.
-                _webSocketServer.ReuseAddress = true;
+                // NOTE: deliberately NOT setting ReuseAddress. On Windows SO_REUSEADDR lets a new
+                // socket bind a port another socket is actively listening on, which would let us
+                // bind alongside a leaked "ghost" listener (two servers, intermittent 501s) and
+                // mask the real failure. A clean AddressAlreadyInUse is the signal we want.
                 _webSocketServer.AddWebSocketService("/McpUnity", () => new McpUnitySocketHandler(this));
                 _webSocketServer.Start();
                 McpLogger.LogInfo($"WebSocket server started successfully on {host}:{McpUnitySettings.Instance.Port}.");
