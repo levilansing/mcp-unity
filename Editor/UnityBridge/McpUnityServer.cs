@@ -220,6 +220,9 @@ namespace McpUnity.Unity
             }
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
             {
+                // DIAGNOSTIC: which loopback address is actually holding the port?
+                McpLogger.LogInfo($"DIAG StartServer bind failed (isRetry={isRetry}); port {McpUnitySettings.Instance.Port} probe: {ProbePort(McpUnitySettings.Instance.Port)}");
+
                 // A listener from a previous domain/instance may still hold the port. Release the
                 // partially-created server and retry once before surfacing the error to the user.
                 if (!isRetry)
@@ -246,6 +249,8 @@ namespace McpUnity.Unity
         /// <param name="closeReason">Optional reason message for the close</param>
         public void StopServer(ushort? closeCode = null, string closeReason = null)
         {
+            McpLogger.LogInfo($"DIAG StopServer: closeCode={closeCode}, serverNull={_webSocketServer == null}, IsListening={IsListening}");
+
             // Tear down whenever a server object exists, even if it is no longer listening
             // (e.g. a half-initialized server from a failed Start) so its socket is released.
             if (_webSocketServer == null)
@@ -263,6 +268,9 @@ namespace McpUnity.Unity
 
                 _webSocketServer.Stop();
 
+                // DIAGNOSTIC: did Stop() actually release the OS socket synchronously?
+                McpLogger.LogInfo($"DIAG post-Stop port probe (port {McpUnitySettings.Instance.Port}): {ProbePort(McpUnitySettings.Instance.Port)}");
+
                 McpLogger.LogInfo("WebSocket server stopped");
             }
             catch (Exception ex)
@@ -275,6 +283,35 @@ namespace McpUnity.Unity
                 Clients.Clear();
                 McpLogger.LogInfo("WebSocket server stopped and resources cleaned up.");
             }
+        }
+
+        /// <summary>
+        /// DIAGNOSTIC helper: probe whether <paramref name="port"/> is bindable on IPv6 and IPv4
+        /// loopback. websocket-sharp binds "localhost" to IPv6 loopback (::1) on Windows, so the
+        /// IPv6 result is the relevant one. Each probe binds then immediately releases.
+        /// </summary>
+        private static string ProbePort(int port)
+        {
+            string Check(System.Net.IPAddress addr)
+            {
+                System.Net.Sockets.TcpListener probe = null;
+                try
+                {
+                    probe = new System.Net.Sockets.TcpListener(addr, port);
+                    probe.Start();
+                    return $"{addr}=FREE";
+                }
+                catch (Exception ex)
+                {
+                    return $"{addr}=BOUND({ex.GetType().Name})";
+                }
+                finally
+                {
+                    try { probe?.Stop(); } catch { }
+                }
+            }
+
+            return $"{Check(System.Net.IPAddress.IPv6Loopback)}, {Check(System.Net.IPAddress.Loopback)}";
         }
 
         /// <summary>
@@ -538,8 +575,10 @@ namespace McpUnity.Unity
         /// </summary>
         private static void OnBeforeAssemblyReload()
         {
-            if (Application.isBatchMode || _instance == null) return;
-            
+            if (Application.isBatchMode) return;
+            McpLogger.LogInfo($"DIAG OnBeforeAssemblyReload: instanceNull={_instance == null}, IsListening={_instance?.IsListening}");
+            if (_instance == null) return;
+
             if (_instance.IsListening)
             {
                 _instance.StopServer();
@@ -553,7 +592,9 @@ namespace McpUnity.Unity
         /// </summary>
         private static void OnAfterAssemblyReload()
         {
-            if (Application.isBatchMode || _instance == null) return;
+            if (Application.isBatchMode) return;
+            McpLogger.LogInfo($"DIAG OnAfterAssemblyReload: instanceNull={_instance == null}, IsListening={_instance?.IsListening}, isPlaying={EditorApplication.isPlaying}");
+            if (_instance == null) return;
 
             // Don't restart while in Play Mode; EnteredEditMode handles the edit-mode restart.
             if (McpUnitySettings.Instance.AutoStartServer && !_instance.IsListening && !EditorApplication.isPlaying)
@@ -569,8 +610,10 @@ namespace McpUnity.Unity
         /// <param name="state">The current play mode state change.</param>
         private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
-            if (Application.isBatchMode || _instance == null) return;
-            
+            if (Application.isBatchMode) return;
+            McpLogger.LogInfo($"DIAG OnPlayModeStateChanged: state={state}, instanceNull={_instance == null}, IsListening={_instance?.IsListening}");
+            if (_instance == null) return;
+
             switch (state)
             {
                 case PlayModeStateChange.ExitingEditMode:
