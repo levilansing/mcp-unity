@@ -268,8 +268,19 @@ namespace McpUnity.Unity
 
                 _webSocketServer.Stop();
 
-                // DIAGNOSTIC: did Stop() actually release the OS socket synchronously?
-                McpLogger.LogInfo($"DIAG post-Stop port probe (port {McpUnitySettings.Instance.Port}): {ProbePort(McpUnitySettings.Instance.Port)}");
+                // websocket-sharp's Stop() can return before its background accept thread has
+                // actually released the listening socket. We are still in the live domain here
+                // (StopServer runs during beforeAssemblyReload / playmode exit), so yield the main
+                // thread and wait briefly for the OS to free the port — otherwise the domain reload
+                // proceeds first and orphans that thread while it still holds the socket (the leak).
+                int port = McpUnitySettings.Instance.Port;
+                int waitedMs = 0;
+                while (!IsPortFree(port) && waitedMs < 2000)
+                {
+                    System.Threading.Thread.Sleep(50);
+                    waitedMs += 50;
+                }
+                McpLogger.LogInfo($"DIAG post-Stop: waited {waitedMs}ms for release, port probe: {ProbePort(port)}");
 
                 McpLogger.LogInfo("WebSocket server stopped");
             }
@@ -312,6 +323,81 @@ namespace McpUnity.Unity
             }
 
             return $"{Check(System.Net.IPAddress.IPv6Loopback)}, {Check(System.Net.IPAddress.Loopback)}";
+        }
+
+        /// <summary>
+        /// Returns true if <paramref name="port"/> can be bound on IPv6 loopback (::1), which is
+        /// the address websocket-sharp uses for "localhost" on Windows.
+        /// </summary>
+        private static bool IsPortFree(int port)
+        {
+            System.Net.Sockets.TcpListener probe = null;
+            try
+            {
+                probe = new System.Net.Sockets.TcpListener(System.Net.IPAddress.IPv6Loopback, port);
+                probe.Start();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                try { probe?.Stop(); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// Stops the MCP WebSocket server (recovery control).
+        /// Exposed as a menu item and a public static method so it can be invoked manually OR
+        /// remotely via another working bridge (e.g. Unity's AI assistant `Unity_RunCommand`):
+        ///   McpUnity.Unity.McpUnityServer.ForceStopServer();
+        /// NOTE: this can only release the socket of the server this domain still holds a reference
+        /// to. A listener orphaned by an earlier domain reload has no managed handle and CANNOT be
+        /// freed in-process — only a Unity Editor restart releases it.
+        /// </summary>
+        [MenuItem("Tools/MCP Unity/Force Stop Server", false, 20)]
+        public static void ForceStopServer()
+        {
+            if (Application.isBatchMode) return;
+
+            Instance?.StopServer();
+
+            int port = McpUnitySettings.Instance.Port;
+            McpLogger.LogInfo($"Force stop requested. Port {port} free now: {IsPortFree(port)}.");
+        }
+
+        /// <summary>
+        /// Stops and restarts the MCP WebSocket server (recovery control).
+        /// Menu item + public static so it can be invoked manually OR remotely via another bridge:
+        ///   McpUnity.Unity.McpUnityServer.ForceRestartServer();
+        /// If the port is still held after the stop (an orphaned listener from a previous domain),
+        /// the restart cannot bind and a Unity Editor restart is required — this reports that
+        /// explicitly instead of silently failing.
+        /// </summary>
+        [MenuItem("Tools/MCP Unity/Force Restart Server", false, 21)]
+        public static void ForceRestartServer()
+        {
+            if (Application.isBatchMode) return;
+
+            var server = Instance;
+            if (server == null) return;
+
+            server.StopServer();
+
+            int port = McpUnitySettings.Instance.Port;
+            if (IsPortFree(port))
+            {
+                server.StartServer();
+                McpLogger.LogInfo($"Force restart complete. Listening: {server.IsListening}.");
+            }
+            else
+            {
+                McpLogger.LogError($"Force restart: port {port} is still in use after stopping. This is " +
+                    "almost certainly a listener orphaned by an earlier domain reload, which has no managed " +
+                    "handle and cannot be released in-process. Restart the Unity Editor to free the port.");
+            }
         }
 
         /// <summary>
