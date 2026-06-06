@@ -75,7 +75,11 @@ namespace McpUnity.Unity
                 return;
             }
 
-            // Touching Instance creates the singleton (if needed) and subscribes its lifecycle hooks.
+            // Verification aid: this fires on every domain load. [DidReloadScripts] does NOT run on
+            // play-mode reloads, so if you see this on play-enter/exit it came from the static
+            // constructor — confirming [InitializeOnLoad] re-init covers the play-mode path.
+            McpLogger.LogInfo($"Domain load: ensuring MCP server is initialized (isPlaying={EditorApplication.isPlaying}).");
+
             var _ = Instance;
         }
 
@@ -216,6 +220,9 @@ namespace McpUnity.Unity
             }
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
             {
+                // DIAGNOSTIC: which loopback address is actually holding the port?
+                McpLogger.LogInfo($"DIAG StartServer bind failed (isRetry={isRetry}); port {McpUnitySettings.Instance.Port} probe: {ProbePort(McpUnitySettings.Instance.Port)}");
+
                 // A listener from a previous domain/instance may still hold the port. Release the
                 // partially-created server and retry once before surfacing the error to the user.
                 if (!isRetry)
@@ -242,6 +249,8 @@ namespace McpUnity.Unity
         /// <param name="closeReason">Optional reason message for the close</param>
         public void StopServer(ushort? closeCode = null, string closeReason = null)
         {
+            McpLogger.LogInfo($"DIAG StopServer: closeCode={closeCode}, serverNull={_webSocketServer == null}, IsListening={IsListening}");
+
             // Tear down whenever a server object exists, even if it is no longer listening
             // (e.g. a half-initialized server from a failed Start) so its socket is released.
             if (_webSocketServer == null)
@@ -257,46 +266,101 @@ namespace McpUnity.Unity
                     CloseAllClients(closeCode.Value, closeReason ?? "Server stopping");
                 }
 
-                // websocket-sharp's Stop() does NOT reliably close the underlying listener socket:
-                // its accept thread stays blocked on the port, and a domain reload then orphans that
+                // websocket-sharp's Stop() does NOT close the underlying listener socket: its
+                // accept thread stays blocked on the port, and a domain reload then orphans that
                 // thread, leaking the port until the process dies. Close the socket ourselves —
                 // while we still hold the reference — so it is released synchronously.
-                ForceCloseUnderlyingListener(_webSocketServer);
+                ForceCloseUnderlyingListener(_webSocketServer, McpUnitySettings.Instance.Port);
 
                 try
                 {
                     _webSocketServer.Stop();
                 }
-                catch
+                catch (Exception stopEx)
                 {
-                    // Stop() can throw because the listener was already closed above; the socket is
-                    // released regardless, so this is safe to ignore.
+                    McpLogger.LogWarning($"WebSocketServer.Stop() threw after force-close (expected): {stopEx.Message}");
                 }
+
+                // Confirm the OS actually freed the port (force-close is synchronous; brief poll).
+                int port = McpUnitySettings.Instance.Port;
+                int waitedMs = 0;
+                while (!IsPortFree(port) && waitedMs < 1000)
+                {
+                    System.Threading.Thread.Sleep(50);
+                    waitedMs += 50;
+                }
+                McpLogger.LogInfo($"DIAG post-Stop: waited {waitedMs}ms, port probe: {ProbePort(port)}");
 
                 McpLogger.LogInfo("WebSocket server stopped");
             }
             catch (Exception ex)
             {
-                McpLogger.LogError($"Error stopping WebSocket server: {ex.Message}\n{ex.StackTrace}");
+                McpLogger.LogError($"Error during WebSocketServer.Stop(): {ex.Message}\n{ex.StackTrace}");
             }
             finally
             {
                 _webSocketServer = null;
                 Clients.Clear();
+                McpLogger.LogInfo("WebSocket server stopped and resources cleaned up.");
             }
         }
 
         /// <summary>
-        /// Forcibly closes the TcpListener/Socket that websocket-sharp's WebSocketServer holds
-        /// internally. Its Stop() does not reliably release the listening socket, so we close it
-        /// directly (via reflection) to unblock the accept thread and free the port synchronously,
-        /// before a domain reload can orphan the thread. Walks the type hierarchy and closes every
-        /// TcpListener/Socket field it finds.
+        /// DIAGNOSTIC helper: probe whether <paramref name="port"/> is bindable on IPv6 and IPv4
+        /// loopback. websocket-sharp binds "localhost" to IPv6 loopback (::1) on Windows, so the
+        /// IPv6 result is the relevant one. Each probe binds then immediately releases.
         /// </summary>
-        private static void ForceCloseUnderlyingListener(WebSocketServer server)
+        private static string ProbePort(int port)
+        {
+            string Check(System.Net.IPAddress addr)
+            {
+                System.Net.Sockets.TcpListener probe = null;
+                try
+                {
+                    probe = new System.Net.Sockets.TcpListener(addr, port);
+                    probe.Start();
+                    return $"{addr}=FREE";
+                }
+                catch (Exception ex)
+                {
+                    return $"{addr}=BOUND({ex.GetType().Name})";
+                }
+                finally
+                {
+                    try { probe?.Stop(); } catch { }
+                }
+            }
+
+            return $"{Check(System.Net.IPAddress.IPv6Loopback)}, {Check(System.Net.IPAddress.Loopback)}";
+        }
+
+        /// <summary>
+        /// Releases the listening socket that websocket-sharp's WebSocketServer holds internally.
+        ///
+        /// websocket-sharp's accept thread (<c>_receiveThread</c>) sits blocked in
+        /// <c>TcpListener.AcceptTcpClient()</c>. On Unity's Mono runtime, closing that listener's
+        /// socket from another thread does NOT return the blocked accept call, so the thread keeps
+        /// the port bound; a domain reload then orphans the thread and leaks the port until the
+        /// process dies. (This is the same reason websocket-sharp's own Stop() fails.)
+        ///
+        /// To actually free the port we have to make the accept thread terminate, not just close a
+        /// handle it still holds: mark the server ShuttingDown, wake the blocked accept with a
+        /// throwaway loopback connection so it returns, then dispose the listener so the loop's next
+        /// iteration throws and the thread exits — which releases the OS port handle.
+        ///
+        /// Heavily instrumented: the logs distinguish "close threw and was swallowed" from "close
+        /// succeeded but the port stayed bound" so the failure mode is unambiguous.
+        /// </summary>
+        private static void ForceCloseUnderlyingListener(WebSocketServer server, int port)
         {
             if (server == null) return;
 
+            System.Net.Sockets.TcpListener liveListener = null;
+            System.Threading.Thread receiveThread = null;
+            System.Reflection.FieldInfo stateField = null;
+
+            // 1. Reflect out the listener, accept thread, and state field — and report exactly what
+            //    the listener is bound to, so a wrong-object / wrong-field theory is falsifiable.
             try
             {
                 for (var type = server.GetType(); type != null && type != typeof(object); type = type.BaseType)
@@ -310,21 +374,106 @@ namespace McpUnity.Unity
                         try { value = field.GetValue(server); }
                         catch { continue; }
 
-                        if (value is System.Net.Sockets.TcpListener listener)
+                        if (value is System.Net.Sockets.TcpListener tcpListener)
                         {
-                            try { listener.Server?.Close(); } catch { }
-                            try { listener.Stop(); } catch { }
+                            string ep, bound;
+                            try { ep = tcpListener.LocalEndpoint != null ? tcpListener.LocalEndpoint.ToString() : "null"; }
+                            catch (Exception e) { ep = "err:" + e.GetType().Name; }
+                            try { bound = tcpListener.Server != null ? tcpListener.Server.IsBound.ToString() : "server=null"; }
+                            catch (Exception e) { bound = "err:" + e.GetType().Name; }
+                            McpLogger.LogInfo($"DIAG ForceClose: TcpListener {type.Name}.{field.Name} LocalEndpoint={ep} IsBound={bound}");
+                            if (liveListener == null) liveListener = tcpListener;
                         }
-                        else if (value is System.Net.Sockets.Socket socket)
+                        else if (value is System.Net.Sockets.Socket sock)
                         {
-                            try { socket.Close(); } catch { }
+                            string sb;
+                            try { sb = $"bound={sock.IsBound} local={sock.LocalEndPoint}"; }
+                            catch (Exception e) { sb = "err:" + e.GetType().Name; }
+                            McpLogger.LogInfo($"DIAG ForceClose: Socket {type.Name}.{field.Name} {sb}");
+                            try { sock.Close(); } catch { }
+                        }
+                        else if (value is System.Threading.Thread thread)
+                        {
+                            McpLogger.LogInfo($"DIAG ForceClose: Thread {type.Name}.{field.Name} name={thread.Name} state={thread.ThreadState} alive={thread.IsAlive}");
+                            if (receiveThread == null) receiveThread = thread;
+                        }
+                        else if (field.FieldType.IsEnum && field.FieldType.Name == "ServerState")
+                        {
+                            stateField = field;
+                            McpLogger.LogInfo($"DIAG ForceClose: ServerState {type.Name}.{field.Name}={value}");
                         }
                     }
                 }
             }
             catch (Exception ex)
             {
-                McpLogger.LogWarning($"Failed to force-close WebSocket listener socket: {ex.Message}");
+                McpLogger.LogWarning($"DIAG ForceClose reflect error: {ex.Message}");
+            }
+
+            // 2. Mark the server ShuttingDown so websocket-sharp's accept loop exits (rather than
+            //    re-accepting) once the blocked AcceptTcpClient() is woken.
+            if (stateField != null)
+            {
+                try
+                {
+                    stateField.SetValue(server, System.Enum.Parse(stateField.FieldType, "ShuttingDown"));
+                    McpLogger.LogInfo("DIAG ForceClose: set ServerState=ShuttingDown");
+                }
+                catch (Exception e)
+                {
+                    McpLogger.LogWarning($"DIAG ForceClose: set state failed: {e.Message}");
+                }
+            }
+
+            // 3. Wake the blocked accept with a throwaway loopback connection. Must happen while the
+            //    listener is still open, or there is nothing to wake.
+            string wokeMsg;
+            try
+            {
+                using (var waker = new System.Net.Sockets.TcpClient())
+                {
+                    var iar = waker.BeginConnect(System.Net.IPAddress.IPv6Loopback, port, null, null);
+                    bool ok = iar.AsyncWaitHandle.WaitOne(250);
+                    if (ok) { try { waker.EndConnect(iar); } catch { } }
+                    wokeMsg = ok ? "connected" : "timeout";
+                }
+            }
+            catch (Exception e)
+            {
+                wokeMsg = "err:" + e.Message;
+            }
+            McpLogger.LogInfo($"DIAG ForceClose: wake-connect [::1]:{port} -> {wokeMsg}");
+
+            // 4. Dispose the listener so the loop's NEXT AcceptTcpClient() throws and the thread
+            //    breaks out. Report whether each call actually threw (the (a)-vs-(b) discriminator).
+            if (liveListener != null)
+            {
+                bool closeThrew = false, stopThrew = false;
+                string closeErr = "", stopErr = "";
+                try { liveListener.Server?.Close(); }
+                catch (Exception e) { closeThrew = true; closeErr = e.GetType().Name + ":" + e.Message; }
+                try { liveListener.Stop(); }
+                catch (Exception e) { stopThrew = true; stopErr = e.GetType().Name + ":" + e.Message; }
+                McpLogger.LogInfo($"DIAG ForceClose: Server.Close threw={closeThrew}{(closeThrew ? "(" + closeErr + ")" : "")}, Stop threw={stopThrew}{(stopThrew ? "(" + stopErr + ")" : "")}");
+            }
+            else
+            {
+                McpLogger.LogWarning("DIAG ForceClose: no TcpListener field found to close.");
+            }
+
+            // 5. Let the accept thread observe the disposed listener and exit — that is what actually
+            //    releases the OS port handle.
+            if (receiveThread != null)
+            {
+                try
+                {
+                    receiveThread.Join(500);
+                    McpLogger.LogInfo($"DIAG ForceClose: receiveThread after join state={receiveThread.ThreadState} alive={receiveThread.IsAlive}");
+                }
+                catch (Exception e)
+                {
+                    McpLogger.LogWarning($"DIAG ForceClose: join failed: {e.Message}");
+                }
             }
         }
 
@@ -664,7 +813,9 @@ namespace McpUnity.Unity
         /// </summary>
         private static void OnBeforeAssemblyReload()
         {
-            if (Application.isBatchMode || _instance == null) return;
+            if (Application.isBatchMode) return;
+            McpLogger.LogInfo($"DIAG OnBeforeAssemblyReload: instanceNull={_instance == null}, IsListening={_instance?.IsListening}");
+            if (_instance == null) return;
 
             if (_instance.IsListening)
             {
@@ -679,7 +830,9 @@ namespace McpUnity.Unity
         /// </summary>
         private static void OnAfterAssemblyReload()
         {
-            if (Application.isBatchMode || _instance == null) return;
+            if (Application.isBatchMode) return;
+            McpLogger.LogInfo($"DIAG OnAfterAssemblyReload: instanceNull={_instance == null}, IsListening={_instance?.IsListening}, isPlaying={EditorApplication.isPlaying}");
+            if (_instance == null) return;
 
             // Don't restart while in Play Mode; EnteredEditMode handles the edit-mode restart.
             if (McpUnitySettings.Instance.AutoStartServer && !_instance.IsListening && !EditorApplication.isPlaying)
@@ -695,7 +848,9 @@ namespace McpUnity.Unity
         /// <param name="state">The current play mode state change.</param>
         private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
-            if (Application.isBatchMode || _instance == null) return;
+            if (Application.isBatchMode) return;
+            McpLogger.LogInfo($"DIAG OnPlayModeStateChanged: state={state}, instanceNull={_instance == null}, IsListening={_instance?.IsListening}");
+            if (_instance == null) return;
 
             switch (state)
             {
