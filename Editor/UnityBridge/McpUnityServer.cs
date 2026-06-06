@@ -75,11 +75,7 @@ namespace McpUnity.Unity
                 return;
             }
 
-            // Verification aid: this fires on every domain load. [DidReloadScripts] does NOT run on
-            // play-mode reloads, so if you see this on play-enter/exit it came from the static
-            // constructor — confirming [InitializeOnLoad] re-init covers the play-mode path.
-            McpLogger.LogInfo($"Domain load: ensuring MCP server is initialized (isPlaying={EditorApplication.isPlaying}).");
-
+            // Touching Instance creates the singleton (if needed) and subscribes its lifecycle hooks.
             var _ = Instance;
         }
 
@@ -220,9 +216,6 @@ namespace McpUnity.Unity
             }
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
             {
-                // DIAGNOSTIC: which loopback address is actually holding the port?
-                McpLogger.LogInfo($"DIAG StartServer bind failed (isRetry={isRetry}); port {McpUnitySettings.Instance.Port} probe: {ProbePort(McpUnitySettings.Instance.Port)}");
-
                 // A listener from a previous domain/instance may still hold the port. Release the
                 // partially-created server and retry once before surfacing the error to the user.
                 if (!isRetry)
@@ -249,8 +242,6 @@ namespace McpUnity.Unity
         /// <param name="closeReason">Optional reason message for the close</param>
         public void StopServer(ushort? closeCode = null, string closeReason = null)
         {
-            McpLogger.LogInfo($"DIAG StopServer: closeCode={closeCode}, serverNull={_webSocketServer == null}, IsListening={IsListening}");
-
             // Tear down whenever a server object exists, even if it is no longer listening
             // (e.g. a half-initialized server from a failed Start) so its socket is released.
             if (_webSocketServer == null)
@@ -266,8 +257,8 @@ namespace McpUnity.Unity
                     CloseAllClients(closeCode.Value, closeReason ?? "Server stopping");
                 }
 
-                // websocket-sharp's Stop() does NOT close the underlying listener socket: its
-                // accept thread stays blocked on the port, and a domain reload then orphans that
+                // websocket-sharp's Stop() does NOT reliably close the underlying listener socket:
+                // its accept thread stays blocked on the port, and a domain reload then orphans that
                 // thread, leaking the port until the process dies. Close the socket ourselves —
                 // while we still hold the reference — so it is released synchronously.
                 ForceCloseUnderlyingListener(_webSocketServer);
@@ -276,76 +267,36 @@ namespace McpUnity.Unity
                 {
                     _webSocketServer.Stop();
                 }
-                catch (Exception stopEx)
+                catch
                 {
-                    McpLogger.LogWarning($"WebSocketServer.Stop() threw after force-close (expected): {stopEx.Message}");
+                    // Stop() can throw because the listener was already closed above; the socket is
+                    // released regardless, so this is safe to ignore.
                 }
-
-                // Confirm the OS actually freed the port (force-close is synchronous; brief poll).
-                int port = McpUnitySettings.Instance.Port;
-                int waitedMs = 0;
-                while (!IsPortFree(port) && waitedMs < 1000)
-                {
-                    System.Threading.Thread.Sleep(50);
-                    waitedMs += 50;
-                }
-                McpLogger.LogInfo($"DIAG post-Stop: waited {waitedMs}ms, port probe: {ProbePort(port)}");
 
                 McpLogger.LogInfo("WebSocket server stopped");
             }
             catch (Exception ex)
             {
-                McpLogger.LogError($"Error during WebSocketServer.Stop(): {ex.Message}\n{ex.StackTrace}");
+                McpLogger.LogError($"Error stopping WebSocket server: {ex.Message}\n{ex.StackTrace}");
             }
             finally
             {
                 _webSocketServer = null;
                 Clients.Clear();
-                McpLogger.LogInfo("WebSocket server stopped and resources cleaned up.");
             }
-        }
-
-        /// <summary>
-        /// DIAGNOSTIC helper: probe whether <paramref name="port"/> is bindable on IPv6 and IPv4
-        /// loopback. websocket-sharp binds "localhost" to IPv6 loopback (::1) on Windows, so the
-        /// IPv6 result is the relevant one. Each probe binds then immediately releases.
-        /// </summary>
-        private static string ProbePort(int port)
-        {
-            string Check(System.Net.IPAddress addr)
-            {
-                System.Net.Sockets.TcpListener probe = null;
-                try
-                {
-                    probe = new System.Net.Sockets.TcpListener(addr, port);
-                    probe.Start();
-                    return $"{addr}=FREE";
-                }
-                catch (Exception ex)
-                {
-                    return $"{addr}=BOUND({ex.GetType().Name})";
-                }
-                finally
-                {
-                    try { probe?.Stop(); } catch { }
-                }
-            }
-
-            return $"{Check(System.Net.IPAddress.IPv6Loopback)}, {Check(System.Net.IPAddress.Loopback)}";
         }
 
         /// <summary>
         /// Forcibly closes the TcpListener/Socket that websocket-sharp's WebSocketServer holds
-        /// internally. Its Stop() does not release the listening socket, so we close it directly
-        /// (via reflection) to unblock the accept thread and free the port synchronously, before a
-        /// domain reload can orphan the thread. Walks the type hierarchy and closes every
+        /// internally. Its Stop() does not reliably release the listening socket, so we close it
+        /// directly (via reflection) to unblock the accept thread and free the port synchronously,
+        /// before a domain reload can orphan the thread. Walks the type hierarchy and closes every
         /// TcpListener/Socket field it finds.
         /// </summary>
         private static void ForceCloseUnderlyingListener(WebSocketServer server)
         {
             if (server == null) return;
 
-            int closed = 0;
             try
             {
                 for (var type = server.GetType(); type != null && type != typeof(object); type = type.BaseType)
@@ -363,22 +314,18 @@ namespace McpUnity.Unity
                         {
                             try { listener.Server?.Close(); } catch { }
                             try { listener.Stop(); } catch { }
-                            closed++;
                         }
                         else if (value is System.Net.Sockets.Socket socket)
                         {
                             try { socket.Close(); } catch { }
-                            closed++;
                         }
                     }
                 }
             }
             catch (Exception ex)
             {
-                McpLogger.LogWarning($"DIAG ForceCloseUnderlyingListener error: {ex.Message}");
+                McpLogger.LogWarning($"Failed to force-close WebSocket listener socket: {ex.Message}");
             }
-
-            McpLogger.LogInfo($"DIAG ForceCloseUnderlyingListener: closed {closed} listener/socket field(s).");
         }
 
         /// <summary>
@@ -717,9 +664,7 @@ namespace McpUnity.Unity
         /// </summary>
         private static void OnBeforeAssemblyReload()
         {
-            if (Application.isBatchMode) return;
-            McpLogger.LogInfo($"DIAG OnBeforeAssemblyReload: instanceNull={_instance == null}, IsListening={_instance?.IsListening}");
-            if (_instance == null) return;
+            if (Application.isBatchMode || _instance == null) return;
 
             if (_instance.IsListening)
             {
@@ -734,9 +679,7 @@ namespace McpUnity.Unity
         /// </summary>
         private static void OnAfterAssemblyReload()
         {
-            if (Application.isBatchMode) return;
-            McpLogger.LogInfo($"DIAG OnAfterAssemblyReload: instanceNull={_instance == null}, IsListening={_instance?.IsListening}, isPlaying={EditorApplication.isPlaying}");
-            if (_instance == null) return;
+            if (Application.isBatchMode || _instance == null) return;
 
             // Don't restart while in Play Mode; EnteredEditMode handles the edit-mode restart.
             if (McpUnitySettings.Instance.AutoStartServer && !_instance.IsListening && !EditorApplication.isPlaying)
@@ -752,9 +695,7 @@ namespace McpUnity.Unity
         /// <param name="state">The current play mode state change.</param>
         private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
-            if (Application.isBatchMode) return;
-            McpLogger.LogInfo($"DIAG OnPlayModeStateChanged: state={state}, instanceNull={_instance == null}, IsListening={_instance?.IsListening}");
-            if (_instance == null) return;
+            if (Application.isBatchMode || _instance == null) return;
 
             switch (state)
             {
