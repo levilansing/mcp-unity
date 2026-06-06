@@ -266,21 +266,30 @@ namespace McpUnity.Unity
                     CloseAllClients(closeCode.Value, closeReason ?? "Server stopping");
                 }
 
-                _webSocketServer.Stop();
+                // websocket-sharp's Stop() does NOT close the underlying listener socket: its
+                // accept thread stays blocked on the port, and a domain reload then orphans that
+                // thread, leaking the port until the process dies. Close the socket ourselves —
+                // while we still hold the reference — so it is released synchronously.
+                ForceCloseUnderlyingListener(_webSocketServer);
 
-                // websocket-sharp's Stop() can return before its background accept thread has
-                // actually released the listening socket. We are still in the live domain here
-                // (StopServer runs during beforeAssemblyReload / playmode exit), so yield the main
-                // thread and wait briefly for the OS to free the port — otherwise the domain reload
-                // proceeds first and orphans that thread while it still holds the socket (the leak).
+                try
+                {
+                    _webSocketServer.Stop();
+                }
+                catch (Exception stopEx)
+                {
+                    McpLogger.LogWarning($"WebSocketServer.Stop() threw after force-close (expected): {stopEx.Message}");
+                }
+
+                // Confirm the OS actually freed the port (force-close is synchronous; brief poll).
                 int port = McpUnitySettings.Instance.Port;
                 int waitedMs = 0;
-                while (!IsPortFree(port) && waitedMs < 2000)
+                while (!IsPortFree(port) && waitedMs < 1000)
                 {
                     System.Threading.Thread.Sleep(50);
                     waitedMs += 50;
                 }
-                McpLogger.LogInfo($"DIAG post-Stop: waited {waitedMs}ms for release, port probe: {ProbePort(port)}");
+                McpLogger.LogInfo($"DIAG post-Stop: waited {waitedMs}ms, port probe: {ProbePort(port)}");
 
                 McpLogger.LogInfo("WebSocket server stopped");
             }
@@ -323,6 +332,53 @@ namespace McpUnity.Unity
             }
 
             return $"{Check(System.Net.IPAddress.IPv6Loopback)}, {Check(System.Net.IPAddress.Loopback)}";
+        }
+
+        /// <summary>
+        /// Forcibly closes the TcpListener/Socket that websocket-sharp's WebSocketServer holds
+        /// internally. Its Stop() does not release the listening socket, so we close it directly
+        /// (via reflection) to unblock the accept thread and free the port synchronously, before a
+        /// domain reload can orphan the thread. Walks the type hierarchy and closes every
+        /// TcpListener/Socket field it finds.
+        /// </summary>
+        private static void ForceCloseUnderlyingListener(WebSocketServer server)
+        {
+            if (server == null) return;
+
+            int closed = 0;
+            try
+            {
+                for (var type = server.GetType(); type != null && type != typeof(object); type = type.BaseType)
+                {
+                    foreach (var field in type.GetFields(System.Reflection.BindingFlags.NonPublic
+                                 | System.Reflection.BindingFlags.Public
+                                 | System.Reflection.BindingFlags.Instance
+                                 | System.Reflection.BindingFlags.DeclaredOnly))
+                    {
+                        object value;
+                        try { value = field.GetValue(server); }
+                        catch { continue; }
+
+                        if (value is System.Net.Sockets.TcpListener listener)
+                        {
+                            try { listener.Server?.Close(); } catch { }
+                            try { listener.Stop(); } catch { }
+                            closed++;
+                        }
+                        else if (value is System.Net.Sockets.Socket socket)
+                        {
+                            try { socket.Close(); } catch { }
+                            closed++;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                McpLogger.LogWarning($"DIAG ForceCloseUnderlyingListener error: {ex.Message}");
+            }
+
+            McpLogger.LogInfo($"DIAG ForceCloseUnderlyingListener: closed {closed} listener/socket field(s).");
         }
 
         /// <summary>
