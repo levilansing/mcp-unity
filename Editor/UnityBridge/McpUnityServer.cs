@@ -468,6 +468,11 @@ namespace McpUnity.Unity
             {
                 using (var waker = new System.Net.Sockets.TcpClient(System.Net.Sockets.AddressFamily.InterNetworkV6))
                 {
+                    // Linger 0 → closing our side sends a RST, so websocket-sharp's accepted
+                    // server-side socket (whose local endpoint IS ::1:port) is torn down
+                    // immediately instead of lingering in CLOSE_WAIT. Otherwise that accepted
+                    // socket gets orphaned by the domain reload and itself keeps the port bound.
+                    try { waker.LingerState = new System.Net.Sockets.LingerOption(true, 0); } catch { }
                     var iar = waker.BeginConnect(System.Net.IPAddress.IPv6Loopback, port, null, null);
                     bool ok = iar.AsyncWaitHandle.WaitOne(500);
                     if (ok) { try { waker.EndConnect(iar); } catch { } }
