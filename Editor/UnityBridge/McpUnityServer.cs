@@ -356,6 +356,7 @@ namespace McpUnity.Unity
             if (server == null) return;
 
             System.Net.Sockets.TcpListener liveListener = null;
+            System.Net.Sockets.Socket rawSocket = null;
             System.Threading.Thread receiveThread = null;
             System.Reflection.FieldInfo stateField = null;
 
@@ -390,7 +391,7 @@ namespace McpUnity.Unity
                             try { sb = $"bound={sock.IsBound} local={sock.LocalEndPoint}"; }
                             catch (Exception e) { sb = "err:" + e.GetType().Name; }
                             McpLogger.LogInfo($"DIAG ForceClose: Socket {type.Name}.{field.Name} {sb}");
-                            try { sock.Close(); } catch { }
+                            if (rawSocket == null) rawSocket = sock;
                         }
                         else if (value is System.Threading.Thread thread)
                         {
@@ -410,8 +411,7 @@ namespace McpUnity.Unity
                 McpLogger.LogWarning($"DIAG ForceClose reflect error: {ex.Message}");
             }
 
-            // 2. Mark the server ShuttingDown so websocket-sharp's accept loop exits (rather than
-            //    re-accepting) once the blocked AcceptTcpClient() is woken.
+            // 2. Mark the server ShuttingDown so any state checks in the accept loop short-circuit.
             if (stateField != null)
             {
                 try
@@ -425,15 +425,51 @@ namespace McpUnity.Unity
                 }
             }
 
-            // 3. Wake the blocked accept with a throwaway loopback connection. Must happen while the
-            //    listener is still open, or there is nothing to wake.
+            // 3. Flip the TcpListener's internal "active" flag to false BEFORE waking the thread, and
+            //    WITHOUT closing the socket yet. This is the race-free core: once active is false the
+            //    loop's next AcceptTcpClient() throws InvalidOperationException in managed code (before
+            //    any native accept), so the accept thread cannot re-block no matter how the timing
+            //    falls. The socket stays open so the wake in step 4 still has something to connect to.
+            //    Log every bool field so the real flag name is visible even if it is not one we guess.
+            if (liveListener != null)
+            {
+                for (var t = liveListener.GetType(); t != null && t != typeof(object); t = t.BaseType)
+                {
+                    foreach (var f in t.GetFields(System.Reflection.BindingFlags.NonPublic
+                                 | System.Reflection.BindingFlags.Public
+                                 | System.Reflection.BindingFlags.Instance
+                                 | System.Reflection.BindingFlags.DeclaredOnly))
+                    {
+                        if (f.FieldType != typeof(bool)) continue;
+                        bool bval;
+                        try { bval = (bool)f.GetValue(liveListener); } catch { continue; }
+                        McpLogger.LogInfo($"DIAG ForceClose: listener bool {t.Name}.{f.Name}={bval}");
+                        if (f.Name == "active" || f.Name == "_active" || f.Name == "m_Active")
+                        {
+                            try
+                            {
+                                f.SetValue(liveListener, false);
+                                McpLogger.LogInfo($"DIAG ForceClose: set listener {f.Name}=false");
+                            }
+                            catch (Exception e)
+                            {
+                                McpLogger.LogWarning($"DIAG ForceClose: set listener {f.Name} failed: {e.Message}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Wake the currently-blocked AcceptTcpClient() with a throwaway IPv6 loopback
+            //    connection (the listener binds ::1). MUST use an IPv6 socket — an IPv4 TcpClient
+            //    connecting to ::1 fails with WSAEPROTONOSUPPORT and wakes nothing.
             string wokeMsg;
             try
             {
-                using (var waker = new System.Net.Sockets.TcpClient())
+                using (var waker = new System.Net.Sockets.TcpClient(System.Net.Sockets.AddressFamily.InterNetworkV6))
                 {
                     var iar = waker.BeginConnect(System.Net.IPAddress.IPv6Loopback, port, null, null);
-                    bool ok = iar.AsyncWaitHandle.WaitOne(250);
+                    bool ok = iar.AsyncWaitHandle.WaitOne(500);
                     if (ok) { try { waker.EndConnect(iar); } catch { } }
                     wokeMsg = ok ? "connected" : "timeout";
                 }
@@ -444,8 +480,28 @@ namespace McpUnity.Unity
             }
             McpLogger.LogInfo($"DIAG ForceClose: wake-connect [::1]:{port} -> {wokeMsg}");
 
-            // 4. Dispose the listener so the loop's NEXT AcceptTcpClient() throws and the thread
-            //    breaks out. Report whether each call actually threw (the (a)-vs-(b) discriminator).
+            // 5. With active=false, the loop's next accept throws and the thread exits. Wait for it —
+            //    a dead accept thread is the precondition for the OS to release the port.
+            if (receiveThread != null)
+            {
+                try
+                {
+                    receiveThread.Join(1500);
+                    McpLogger.LogInfo($"DIAG ForceClose: receiveThread after join state={receiveThread.ThreadState} alive={receiveThread.IsAlive}");
+                }
+                catch (Exception e)
+                {
+                    McpLogger.LogWarning($"DIAG ForceClose: join failed: {e.Message}");
+                }
+            }
+            else
+            {
+                McpLogger.LogInfo("DIAG ForceClose: no receive thread (server was never started).");
+            }
+
+            // 6. The accept thread is gone — now close the listening socket to free the port. Rely on
+            //    Server.Close() for the actual release (Mono's TcpListener.Stop() may no-op once active
+            //    is false). Report whether either call threw (close-failed vs released-but-still-bound).
             if (liveListener != null)
             {
                 bool closeThrew = false, stopThrew = false;
@@ -461,19 +517,10 @@ namespace McpUnity.Unity
                 McpLogger.LogWarning("DIAG ForceClose: no TcpListener field found to close.");
             }
 
-            // 5. Let the accept thread observe the disposed listener and exit — that is what actually
-            //    releases the OS port handle.
-            if (receiveThread != null)
+            if (rawSocket != null)
             {
-                try
-                {
-                    receiveThread.Join(500);
-                    McpLogger.LogInfo($"DIAG ForceClose: receiveThread after join state={receiveThread.ThreadState} alive={receiveThread.IsAlive}");
-                }
-                catch (Exception e)
-                {
-                    McpLogger.LogWarning($"DIAG ForceClose: join failed: {e.Message}");
-                }
+                try { rawSocket.Close(); McpLogger.LogInfo("DIAG ForceClose: closed raw Socket field."); }
+                catch (Exception e) { McpLogger.LogWarning($"DIAG ForceClose: raw socket close failed: {e.Message}"); }
             }
         }
 
